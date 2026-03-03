@@ -305,7 +305,9 @@ class TestTritonAttention(CustomTestCase):
         )
 
         self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2, atol=1e-3))
-        self.assertTrue(torch.allclose(o_extend_mask, o_redundant, rtol=1e-2, atol=1e-3))
+        self.assertTrue(
+            torch.allclose(o_extend_mask, o_redundant, rtol=1e-2, atol=1e-3)
+        )
 
     def test_extend_attention(self):
 
