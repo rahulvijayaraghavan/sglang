@@ -2938,7 +2938,7 @@ def draft_decode_set_expand_metadata(
 
 
 # Copied from:
-# https://github.com/houseroad/vllm/blob/4e45bfcaf928bdb9bd952b4ac922a3c205589ae8/vllm/v1/attention/backends/flash_attn.py
+# https://github.com/vllm-project/vllm/blob/c5e3454e5adf063d5af75140c36a7f900a9e4c4c/vllm/v1/attention/backends/utils.py
 #
 # Take in `query_start_loc_np` and `seq_lens_np` and break the sequences into
 # local attention blocks, where each block is passed to the attention kernel
@@ -2996,7 +2996,7 @@ def make_local_attention_virtual_batches(
     query_start_loc_np: np.ndarray,
     seq_lens_np: np.ndarray,
     block_table: torch.Tensor,
-    page_size: int = 0,
+    block_size: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor]:
     """
     Take in `query_start_loc_np` and `seq_lens_np` and break the sequences into
@@ -3008,7 +3008,7 @@ def make_local_attention_virtual_batches(
         query_start_loc_np: Cumulative sum of query lengths (numpy array)
         seq_lens_np: Sequence lengths (numpy array)
         block_table: Block table for KV cache
-        page_size: Size of each page in the KV cache
+        block_size: Size of each block in the KV cache
 
     Returns:
         seqlens_q_local: Query sequence lengths for local attention
@@ -3016,16 +3016,6 @@ def make_local_attention_virtual_batches(
         seqlens_k_local: Key sequence lengths for local attention
         block_table_local: Block table for local attention
     """
-    # Adjust attention_chunk_size based on the actual sequence length
-    # to avoid index out of bounds errors
-    max_seq_len = seq_lens_np.max()
-    effective_chunk_size = min(attn_chunk_size, max_seq_len)
-    # Make sure effective_chunk_size is divisible by page_size
-    effective_chunk_size = (effective_chunk_size // page_size) * page_size
-    if effective_chunk_size < page_size:
-        effective_chunk_size = page_size
-    attn_chunk_size = effective_chunk_size
-
     q_seqlens = query_start_loc_np[1:] - query_start_loc_np[:-1]
     actual_batch_size = seq_lens_np.shape[0]
 
@@ -3053,7 +3043,7 @@ def make_local_attention_virtual_batches(
     #   seqlens_q_local = [2, 2, 1, 4, 4, 1, 4, 1]
     #
     # First Get batched arange. (E.g., [2, 4, 2] -> [0, 1, 0, 1, 2, 3, 0, 1])
-    #   (TODO: max a utility to share this code with _prepare_inputs)
+    #   (TODO: make a utility to share this code with _prepare_inputs)
     # arange step 1. [2, 4, 2] -> [2, 6, 8]
     cu_num_blocks = np.cumsum(local_blocks)
     virtual_batches = cu_num_blocks[-1]
@@ -3074,7 +3064,9 @@ def make_local_attention_virtual_batches(
     )[arange > 0]
 
     # convert from q_seqlens to cu_seqlens_q
-    cu_seqlens_q_local = np.pad(np.cumsum(seqlens_q_local), (1, 0)).astype(np.int32)
+    cu_seqlens_q_local = np.empty(virtual_batches + 1, dtype=np.int32)
+    np.cumsum(seqlens_q_local, out=cu_seqlens_q_local[1:])
+    cu_seqlens_q_local[0] = 0
 
     # compute the seqlens_k_local,
     #  basically a full local attention block for all but the last block in each
@@ -3090,16 +3082,14 @@ def make_local_attention_virtual_batches(
     # For the example the local attention blocks start at:
     #                           _b0_  _____b1_____  _b2_
     #   k_seqstarts_absolute = [0, 4, 4, 8, 12, 16, 4, 8]
-    block_starts = k_seqstarts_absolute // page_size
-
-    assert attn_chunk_size % page_size == 0, (
-        f"attn_chunk_size {attn_chunk_size} is not "
-        f"divisible by page_size {page_size}"
+    block_starts = k_seqstarts_absolute // block_size
+    assert attn_chunk_size % block_size == 0, (
+        f"attn_chunk_size {attn_chunk_size} is not divisible by block_size {block_size}"
     )
-    pages_per_local_batch = attn_chunk_size // page_size
+    pages_per_local_batch = attn_chunk_size // block_size
 
     # Create a block_table for the local attention blocks
-    # For out example if we have a block-table like (assuming page_size=2):
+    # For our example if we have a block-table like (assuming block_size=2):
     #   block_table = [
     #     [ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9],  < batch 0
     #     [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],  < batch 1
@@ -3116,15 +3106,10 @@ def make_local_attention_virtual_batches(
     #     [ 22, 23 ], < local-batch 6, (batch 2, starting from k[4])
     #     [ 24, 25 ], < local-batch 7, (batch 2, starting from k[8])
     #   ]
-    block_indices = np.broadcast_to(
-        np.arange(pages_per_local_batch, dtype=np.int32),
-        (virtual_batches, pages_per_local_batch),
-    ) + np.expand_dims(block_starts, axis=1)
-    # Ensure block_indices doesn't exceed block_table dimensions
-    # This is a critical safety check that prevents index out of bounds errors
-    # when dealing with large sequences (>8192 tokens) or when the block_table
-    # dimensions are smaller than what would be needed for the full attention chunk size.
-    block_indices = block_indices.flatten().clip(max=block_table.shape[1] - 1)
+    block_indices = block_starts[:, None] + np.arange(
+        pages_per_local_batch, dtype=np.int32
+    )
+    block_indices = block_indices.reshape(-1).clip(max=block_table.shape[1] - 1)
     batch_indices = np.repeat(
         np.arange(actual_batch_size, dtype=np.int32),
         local_blocks * pages_per_local_batch,
@@ -3136,9 +3121,11 @@ def make_local_attention_virtual_batches(
     # tensor first, which recovers perf.
     batch_indices_torch = torch.from_numpy(batch_indices)
     block_indices_torch = torch.from_numpy(block_indices)
-    block_table_local = block_table[batch_indices_torch, block_indices_torch].view(
-        virtual_batches, -1
-    )
+
+    make_block_table = lambda block_table: block_table[
+        batch_indices_torch, block_indices_torch
+    ].view(virtual_batches, -1)
+    block_table_local = make_block_table(block_table)
 
     return seqlens_q_local, cu_seqlens_q_local, seqlens_k_local, block_table_local
 
