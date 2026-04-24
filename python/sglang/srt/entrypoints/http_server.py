@@ -1596,6 +1596,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            print(f"Warmup request successful: {res.json()}", flush=True)  # TODO: remove after debugging
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
