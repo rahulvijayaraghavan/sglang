@@ -22,6 +22,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -39,9 +40,11 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
@@ -57,6 +60,19 @@ elif _is_hip:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
         from vllm import _custom_ops as vllm_ops
+elif _is_xpu:
+    from sgl_kernel import moe_sum_reduce, silu_and_mul
+
+# Try to import vllm_ops for non-CUDA/HIP/XPU platforms
+_has_vllm_ops = False
+if not _is_cuda and not _is_hip and not _is_xpu:
+    try:
+        from vllm import _custom_ops as vllm_ops
+
+        _has_vllm_ops = True
+    except ImportError:
+        # Fallback: vllm not available, will use native PyTorch implementations
+        _has_vllm_ops = False
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -515,7 +531,7 @@ def fused_experts_impl(
                         intermediate_cache1[:, half:].clamp_(min=-swiglu_limit, max=swiglu_limit)
                         deepseek_v4_moe_code_path_checker.observed += 1
 
-                if _is_cuda or _is_hip:
+                if _is_cuda or _is_hip or _is_xpu:
                     if not filter_expert:
                         silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                     else:
@@ -632,6 +648,28 @@ def fused_experts_impl(
                 moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
+            else:
+                # According to micro benchmark results, torch.compile can get better performance for small token.
+                if tokens_in_chunk <= 32:
+                    moe_sum_reduce_torch_compile(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                        routed_scaling_factor,
+                    )
+                else:
+                    moe_sum_reduce_triton(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                        routed_scaling_factor,
+                    )
+        elif _is_xpu:
+            _force_triton = envs.SGLANG_FORCE_TRITON_MOE_FP8.get()
+            if not _force_triton:
+                moe_sum_reduce(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states,
+                    routed_scaling_factor,
                 )
             else:
                 # According to micro benchmark results, torch.compile can get better performance for small token.
