@@ -4,9 +4,9 @@ import os
 import random
 from typing import List, Optional
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 
-if is_hip():
+if is_hip() or is_xpu():
     pass
 else:
     import flash_mla

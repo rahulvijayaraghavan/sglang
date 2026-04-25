@@ -4,12 +4,16 @@ import weakref
 from typing import Optional
 
 import torch
-from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
 )
+from sglang.srt.utils import is_npu, is_xpu
+
+if not (is_npu() or is_xpu()):
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+
 from sglang.srt.mem_cache.deepseekv4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,

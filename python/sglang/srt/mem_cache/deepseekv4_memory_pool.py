@@ -5,9 +5,12 @@ from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
-from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 
 from sglang.jit_kernel.deepseek_v4 import fused_store_cache
+from sglang.srt.utils import is_npu, is_xpu
+
+if not (is_npu() or is_xpu()):
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa import index_buf_accessor, index_buf_accessor_v4
