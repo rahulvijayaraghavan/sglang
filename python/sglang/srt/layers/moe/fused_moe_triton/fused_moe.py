@@ -518,15 +518,17 @@ def fused_experts_impl(
                         _is_cuda or _is_hip or _is_xpu
                     ), "DSV4 2604 submode 2604B only supports CUDA/HIP/XPU downstream"
 
-                    if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                    if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get() and (
+                        filter_expert or _is_cuda
+                    ):
                         if filter_expert:
                             swiglu_limit_for_triton = swiglu_limit
                         else:
-                            assert (
-                                _is_cuda
-                            ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
                             swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
                     else:
+                        # Manual clamp fallback (used on HIP/XPU or when fusion
+                        # is disabled). The fused silu_and_mul_clamp kernel is
+                        # CUDA-only.
                         half = N // 2
                         intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
                         intermediate_cache1[:, half:].clamp_(
@@ -675,27 +677,11 @@ def fused_experts_impl(
                         routed_scaling_factor,
                     )
         elif _is_xpu:
-            _force_triton = envs.SGLANG_FORCE_TRITON_MOE_FP8.get()
-            if not _force_triton:
-                moe_sum_reduce(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                    routed_scaling_factor,
-                )
-            else:
-                # According to micro benchmark results, torch.compile can get better performance for small token.
-                if tokens_in_chunk <= 32:
-                    moe_sum_reduce_torch_compile(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
-                        out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                        routed_scaling_factor,
-                    )
-                else:
-                    moe_sum_reduce_triton(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
-                        out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                        routed_scaling_factor,
-                    )
+            moe_sum_reduce(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states,
+                routed_scaling_factor,
+            )
         else:
             vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
