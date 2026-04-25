@@ -514,8 +514,8 @@ def fused_experts_impl(
                 if is_2604b:
                     assert swiglu_limit == 10
                     assert intermediate_cache1.shape == (total_tokens, N)
-                    assert (_is_cuda or _is_hip), \
-                        "DSV4 2604 submode 2604B only supports CUDA/HIP downstream"
+                    assert (_is_cuda or _is_hip or _is_xpu), \
+                        "DSV4 2604 submode 2604B only supports CUDA/HIP/XPU downstream"
 
                     if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
                         # Fusion path passes the limit into act_and_mul_triton, which
