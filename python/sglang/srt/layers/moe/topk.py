@@ -258,7 +258,17 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        self.topk_config.torch_native = True
+        # Only force the naive torch_native path when the richer pure-torch
+        # paths (grouped_topk / biased_topk_impl) are not applicable. The
+        # naive fused_topk_torch_native ignores num_fused_shared_experts and
+        # routed_scaling_factor, which is required by DeepSeek V4 (sqrtsoftplus
+        # + correction_bias).
+        if not (
+            self.topk_config.scoring_func == "sqrtsoftplus"
+            and self.topk_config.correction_bias is not None
+            and not self.topk_config.use_grouped_topk
+        ):
+            self.topk_config.torch_native = True
         return select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
@@ -386,12 +396,16 @@ def fused_topk_torch_native(
             return gating_output.softmax(dim=-1)
         elif scoring_func == "sigmoid":
             return gating_output.sigmoid()
+        elif scoring_func == "sqrtsoftplus":
+            return torch.nn.functional.softplus(gating_output).sqrt()
         else:
             raise ValueError(f"Invalid scoring function: {scoring_func}")
 
     if correction_bias is not None:
         n_routed_experts = gating_output.shape[-1]
         scores = scoring_func_impl(gating_output)
+        if correction_bias.device != scores.device:
+            correction_bias = correction_bias.to(scores.device)
         scores_for_choice = scores.view(
             -1, n_routed_experts
         ) + correction_bias.unsqueeze(0)
