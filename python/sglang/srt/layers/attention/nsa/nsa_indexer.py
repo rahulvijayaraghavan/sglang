@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+_is_xpu = is_xpu()
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -161,10 +163,32 @@ class BaseIndexerMetadata(ABC):
         """
 
 
+def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pure-torch FWHT fallback for backends without a fused kernel.
+
+    Iterative Cooley-Tukey-style Walsh-Hadamard transform along the last
+    dim. Hidden size must be a power of two; same contract as the fused
+    ``hadamard_transform`` op.
+    """
+    n = x.size(-1)
+    leading = x.shape[:-1]
+    out = x.reshape(-1, n).clone()
+    h = 1
+    while h < n:
+        out = out.view(-1, n // (2 * h), 2, h)
+        a = out[:, :, 0, :]
+        b = out[:, :, 1, :]
+        out = torch.stack((a + b, a - b), dim=2).view(-1, n)
+        h *= 2
+    return out.view(*leading, n) * scale
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
+    elif _is_xpu:
+        hadamard_transform = _torch_hadamard_transform
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
