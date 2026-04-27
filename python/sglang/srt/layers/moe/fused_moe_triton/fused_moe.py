@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 from typing import TYPE_CHECKING, List, Optional
 
@@ -74,6 +75,98 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         _has_vllm_ops = False
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
+logger = logging.getLogger(__name__)
+
+
+def _is_mxfp4_xpu_packed(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+) -> bool:
+    """Detect MXFP4-packed routed-expert weights on XPU.
+
+    The DSv4 fp8 checkpoint loader passes ``use_fp8_w8a8=True`` for routed
+    experts that are actually MXFP4 (e.g. DeepSeek-V4-Flash), so we must
+    NOT exclude on ``use_fp8_w8a8``. We discriminate MXFP4 from real FP8
+    weights via the packed-last-dim invariant:
+        - MXFP4 routed experts: w1.shape[-1] == hidden_size // 2
+        - FP8  shared experts : w1.shape[-1] == hidden_size  (skip)
+    """
+    return (
+        _is_xpu
+        and not (use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        and (w1.dtype == torch.uint8 or w1.dtype == torch.int8)
+        and (w2.dtype == torch.uint8 or w2.dtype == torch.int8)
+        and w1_scale is not None
+        and w2_scale is not None
+        and w1.shape[-1] * 2 == hidden_states.shape[-1]
+    )
+
+
+def _upcast_mxfp4_one_xpu(
+    w_packed: torch.Tensor,
+    w_scale: torch.Tensor,
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Upcast a single MXFP4-packed expert tensor to bf16/fp16.
+
+    Returns a fresh contiguous tensor whose last dim is doubled. Caller is
+    responsible for releasing it (``del`` + ``torch.xpu.empty_cache()``)
+    once the GEMM consuming it has returned, so peak transient stays at
+    one weight (~8 GiB for w1, ~4 GiB for w2 at TP=1) instead of both.
+    """
+    from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+
+    # upcast_from_mxfp asserts tensor.dtype in {uint8, fp8_e5m2, fp8_e4m3fn}
+    # and scale.dtype == uint8.
+    w_u8 = w_packed if w_packed.dtype == torch.uint8 else w_packed.to(torch.uint8)
+    s_u8 = w_scale if w_scale.dtype == torch.uint8 else w_scale.to(torch.uint8)
+    return upcast_from_mxfp(
+        w_u8, s_u8, target_dtype=target_dtype, axis=-1
+    ).contiguous()
+
+
+def _log_mxfp4_xpu_budget(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    target_dtype: torch.dtype,
+) -> None:
+    """Diagnostic: free/total XPU memory and per-weight bf16 transient cost.
+
+    Logged at INFO so it's visible without raising the global log level;
+    fires once per MXFP4 MoE call.
+    """
+    elem_size = torch.tensor([], dtype=target_dtype).element_size()
+    # Packed weights have last dim = K // 2; bf16 output has last dim = K.
+    w1_bytes = w1.numel() * 2 * elem_size
+    w2_bytes = w2.numel() * 2 * elem_size
+    try:
+        free_bytes, total_dev_bytes = torch.xpu.mem_get_info(hidden_states.device)
+        mem_str = (
+            f"xpu_free={free_bytes / 1024**3:.2f} GiB "
+            f"xpu_total={total_dev_bytes / 1024**3:.2f} GiB"
+        )
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        mem_str = f"xpu_free=<unavailable: {exc!r}>"
+    logger.info(
+        "MXFP4 upcast (sequenced) on %s: %s; per-GEMM transient w1=%.2f GiB, "
+        "w2=%.2f GiB (target_dtype=%s, w1.shape=%s, w2.shape=%s, hidden=%d)",
+        hidden_states.device,
+        mem_str,
+        w1_bytes / 1024**3,
+        w2_bytes / 1024**3,
+        target_dtype,
+        tuple(w1.shape),
+        tuple(w2.shape),
+        hidden_states.shape[-1],
+    )
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -229,6 +322,10 @@ def fused_experts(
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+    # MXFP4-packed routed experts on XPU are kept in their packed form
+    # here and dequantized to bf16 lazily inside ``fused_experts_impl``,
+    # interleaved with each GEMM call so peak transient memory is one
+    # weight (~8 GiB w1 / ~4 GiB w2 at TP=1) instead of both at once.
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -344,12 +441,45 @@ def fused_experts_impl(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
 ):
-    padded_size = padding_size
-    if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
+    # MXFP4-packed routed experts on XPU arrive here as uint8 with last
+    # dim = K/2 plus uint8 E8M0 scales. We dequantize to bf16 lazily, one
+    # weight at a time, freeing each bf16 buffer between the up- and
+    # down-projection GEMMs to keep peak transient at ~8 GiB (TP=1)
+    # instead of ~12 GiB.
+    mxfp4_xpu = _is_mxfp4_xpu_packed(
+        hidden_states, w1, w2, w1_scale, w2_scale,
+        use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
+    )
+    if mxfp4_xpu:
+        mxfp4_target_dtype = (
+            hidden_states.dtype
+            if hidden_states.dtype in (torch.float16, torch.bfloat16)
+            else torch.bfloat16
+        )
+        _log_mxfp4_xpu_budget(hidden_states, w1, w2, mxfp4_target_dtype)
+        # The bf16 GEMM that follows must NOT see fp8/block-quant flags or
+        # the packed scales: those are folded into the upcast result.
+        gemm_use_fp8_w8a8 = False
+        gemm_block_shape: Optional[List[int]] = None
+        gemm_w1_scale: Optional[torch.Tensor] = None
+        gemm_w2_scale: Optional[torch.Tensor] = None
         padded_size = 0
+    else:
+        gemm_use_fp8_w8a8 = use_fp8_w8a8
+        gemm_block_shape = block_shape
+        gemm_w1_scale = w1_scale
+        gemm_w2_scale = w2_scale
+        padded_size = padding_size
+        if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
+            padded_size = 0
 
     # Check constraints.
-    if use_int4_w4a16:
+    if mxfp4_xpu:
+        # Packed last dim is K/2; bf16 last dim after upcast is K.
+        assert (
+            hidden_states.shape[1] == w1.shape[2] * 2
+        ), "MXFP4 packed hidden dim mismatch"
+    elif use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
@@ -368,20 +498,30 @@ def fused_experts_impl(
     CHUNK_SIZE = 64 * 1024
     M = min(num_tokens, CHUNK_SIZE)
     config_dtype = get_config_dtype_str(
-        use_fp8_w8a8=use_fp8_w8a8,
+        use_fp8_w8a8=gemm_use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         dtype=hidden_states.dtype,
     )
 
+    # MXFP4 weights are packed with last dim = K/2; the GEMM operates on
+    # the bf16 tensor with last dim = K, so feed the unpacked shape to
+    # the tile-config selector.
+    if mxfp4_xpu:
+        w1_shape_for_cfg = (w1.shape[0], w1.shape[1], hidden_states.shape[1])
+        w2_shape_for_cfg = (w2.shape[0], w2.shape[1], w2.shape[2] * 2)
+    else:
+        w1_shape_for_cfg = w1.shape
+        w2_shape_for_cfg = (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size)
+
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
-        w1.shape,
-        (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size),
+        w1_shape_for_cfg,
+        w2_shape_for_cfg,
         topk_ids.shape[1],
         config_dtype,
-        block_shape=block_shape,
+        block_shape=gemm_block_shape,
         per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
@@ -466,13 +606,20 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
+        # MXFP4 (XPU): upcast w1 just-in-time. Released right after GEMM1
+        # so w2's upcast doesn't have to share the budget.
+        if mxfp4_xpu:
+            w1_eff = _upcast_mxfp4_one_xpu(w1, w1_scale, mxfp4_target_dtype)
+        else:
+            w1_eff = w1
+
         invoke_fused_moe_kernel(
             curr_hidden_states,
-            w1,
+            w1_eff,
             b1,
             intermediate_cache1,
             a1_scale,
-            w1_scale,
+            gemm_w1_scale,
             w1_zp,
             curr_topk_weights,
             curr_topk_ids,
@@ -483,15 +630,21 @@ def fused_experts_impl(
             topk_ids.shape[1],
             config,
             compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
+            use_fp8_w8a8=gemm_use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
+            block_shape=gemm_block_shape,
             c_sorted=down_moe_use_tma,
             filter_expert=filter_expert,
         )
+
+        # Release bf16 w1 immediately so the w2 upcast that follows GEMM1
+        # has the full transient budget to itself.
+        if mxfp4_xpu:
+            del w1_eff
+            torch.xpu.empty_cache()
 
         # Activation function with multiplication
         if activation == "silu" and is_gated:
@@ -593,9 +746,15 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
+        # MXFP4 (XPU): upcast w2 just-in-time for GEMM2.
+        if mxfp4_xpu:
+            w2_eff = _upcast_mxfp4_one_xpu(w2, w2_scale, mxfp4_target_dtype)
+        else:
+            w2_eff = w2
+
         invoke_fused_moe_kernel(
             intermediate_cache2,
-            w2,
+            w2_eff,
             b2,
             (
                 intermediate_cache3
@@ -603,7 +762,7 @@ def fused_experts_impl(
                 else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
             ),
             a2_scale,
-            w2_scale,
+            gemm_w2_scale,
             w2_zp,
             curr_topk_weights,
             curr_topk_ids,
@@ -614,16 +773,20 @@ def fused_experts_impl(
             1,
             down_config or config,
             compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
+            use_fp8_w8a8=gemm_use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
+            block_shape=gemm_block_shape,
             a_use_tma=down_moe_use_tma,
             b_use_tma=down_moe_use_tma,
             filter_expert=filter_expert,
         )
+
+        if mxfp4_xpu:
+            del w2_eff
+            torch.xpu.empty_cache()
 
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
