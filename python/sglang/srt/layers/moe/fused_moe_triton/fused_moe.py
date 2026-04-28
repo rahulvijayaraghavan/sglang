@@ -109,27 +109,62 @@ def _is_mxfp4_xpu_packed(
     )
 
 
+# E2M1 lookup table: nibble value 0x0–0xF → float
+_E2M1_LUT = torch.tensor(
+    [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,        # 0b0xxx (positive)
+        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,  # 0b1xxx (negative)
+    ],
+    dtype=torch.float32,
+)
+
+# Number of experts to dequantize per iteration. Keeps peak intermediate
+# memory at ~CHUNK * N * K/2 * 10 bytes instead of E * N * K/2 * 10 bytes.
+_MXFP4_DEQUANT_EXPERT_CHUNK = 4
+
+
 def _upcast_mxfp4_one_xpu(
     w_packed: torch.Tensor,
     w_scale: torch.Tensor,
     target_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Upcast a single MXFP4-packed expert tensor to bf16/fp16.
+    """Upcast a single MXFP4-packed expert tensor to *target_dtype*.
 
-    Returns a fresh contiguous tensor whose last dim is doubled. Caller is
-    responsible for releasing it (``del`` + ``torch.xpu.empty_cache()``)
-    once the GEMM consuming it has returned, so peak transient stays at
-    one weight (~8 GiB for w1, ~4 GiB for w2 at TP=1) instead of both.
+    Packing convention (matches DeepSeek / sgl-kernel-xpu):
+        byte = [first_elem (high nibble) | second_elem (low nibble)]
+
+    w_packed : [E, N, K//2]  uint8/int8   — two E2M1 values per byte
+    w_scale  : [E, N, K//32] float32      — MX block scale (direct multiplier)
+    Returns  : [E, N, K]     target_dtype — contiguous
     """
-    from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+    w_u8 = w_packed.view(torch.uint8)
+    E, N, half_K = w_u8.shape
+    K = half_K * 2
 
-    # upcast_from_mxfp asserts tensor.dtype in {uint8, fp8_e5m2, fp8_e4m3fn}
-    # and scale.dtype == uint8.
-    w_u8 = w_packed if w_packed.dtype == torch.uint8 else w_packed.to(torch.uint8)
-    s_u8 = w_scale if w_scale.dtype == torch.uint8 else w_scale.to(torch.uint8)
-    return upcast_from_mxfp(
-        w_u8, s_u8, target_dtype=target_dtype, axis=-1
-    ).contiguous()
+    lut = _E2M1_LUT.to(device=w_u8.device, dtype=torch.bfloat16)
+    out = torch.empty(E, N, K, dtype=torch.bfloat16, device=w_u8.device)
+
+    # Chunk over the expert dimension so the int64 index tensors
+    # (required by PyTorch advanced indexing) stay small.
+    CHUNK = _MXFP4_DEQUANT_EXPERT_CHUNK
+    for start in range(0, E, CHUNK):
+        end = min(start + CHUNK, E)
+        chunk = w_u8[start:end]                       # [C, N, half_K]
+        hi = ((chunk >> 4) & 0xF).long()              # high nibble
+        lo = (chunk & 0xF).long()                     # low nibble
+        # [0xAB] → [B, A]: low nibble first, high nibble second
+        paired = torch.stack((lut[lo], lut[hi]), dim=-1)  # [C, N, half_K, 2]
+        out[start:end] = paired.view(end - start, N, K)
+        del hi, lo, paired
+
+    # Apply MX block scales (group_size=32) in-place
+    out = out.view(E, N, K // 32, 32)
+    out.mul_(w_scale.unsqueeze(-1).to(torch.bfloat16))
+    out = out.contiguous().view(E, N, K)
+
+    if target_dtype != torch.bfloat16:
+        out = out.to(target_dtype)
+    return out
 
 
 def _log_mxfp4_xpu_budget(
