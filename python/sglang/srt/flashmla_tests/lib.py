@@ -10,7 +10,7 @@ from sglang.srt.utils import is_cuda, is_hip
 # the import would fail, but the helpers in this module that actually use
 # flash_mla (run_flash_mla_sparse_fwd / run_flash_mla_decode) are only
 # invoked from the comparison/kernel paths and not from the torch fallback.
-if is_cuda():
+if False:
     import flash_mla
 
 import torch
