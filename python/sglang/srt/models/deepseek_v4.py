@@ -1043,7 +1043,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        from sglang.srt.layers.mhc import hc_split_sinkhorn
+        if False:
+            from sglang.srt.layers.mhc import hc_split_sinkhorn
 
         pre, post, comb = hc_split_sinkhorn(
             mixes,
