@@ -12,6 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.compressed.metadata import (
     PagedCoreMetadata,
     PagedIndexerMetadata,
+    _is_sm120,
 )
 from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
@@ -54,6 +55,8 @@ def fp8_paged_mqa_logits_torch(
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
@@ -376,7 +379,7 @@ class C4IndexerBackend:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120:
             fn = fp8_paged_mqa_logits_torch
         else:
             if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:

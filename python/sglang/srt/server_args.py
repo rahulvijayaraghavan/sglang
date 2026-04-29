@@ -1135,18 +1135,34 @@ class ServerArgs:
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
     def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+        from sglang.srt.utils import is_sm120_supported
+
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
         if kv_cache_dtype == "fp8_e4m3":
-            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-            if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_auto"
-            if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_kv"
+            if is_sm120_supported():
+                # SM120: trtllm_mha does not support SM120; use tilelang for both paths.
+                # flashmla_auto may also work but is unverified on SM120.
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "tilelang"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "tilelang"
+            else:
+                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_auto"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
-            if major >= 10:
+            if is_sm120_supported():
+                # SM120: trtllm does not support SM120; use tilelang (portable)
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "tilelang"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "tilelang"
+            elif major >= 10:
                 if not user_set_prefill:
                     self.nsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:

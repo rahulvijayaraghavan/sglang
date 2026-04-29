@@ -32,7 +32,7 @@ from sglang.srt.layers.attention.compressed.metadata import (
     PagedIndexerMetadata,
     maybe_copy_inplace,
 )
-from sglang.srt.layers.attention.debug_flash_mla_adapter import (
+from sglang.srt.layers.attention.flash_mla_sm120_fallback import (
     flash_mla_with_kvcache_entrypoint,
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
