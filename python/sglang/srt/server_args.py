@@ -1235,7 +1235,7 @@ class ServerArgs:
                     f"Setting swa_full_tokens_ratio to {self.swa_full_tokens_ratio} for {model_arch}."
                 )
             self._set_default_nsa_backends(self.kv_cache_dtype, None)
-            self.moe_runner_backend = "marlin"
+            self.moe_runner_backend = "triton"
 
 
         if model_arch in [
