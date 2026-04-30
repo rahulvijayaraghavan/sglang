@@ -491,7 +491,7 @@ def fused_experts_impl(
             if hidden_states.dtype in (torch.float16, torch.bfloat16)
             else torch.bfloat16
         )
-        _log_mxfp4_xpu_budget(hidden_states, w1, w2, mxfp4_target_dtype)
+        # _log_mxfp4_xpu_budget(hidden_states, w1, w2, mxfp4_target_dtype)
         # The bf16 GEMM that follows must NOT see fp8/block-quant flags or
         # the packed scales: those are folded into the upcast result.
         gemm_use_fp8_w8a8 = False
