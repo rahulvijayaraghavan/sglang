@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v4 import C4Indexer
 
+__is_xpu = is_xpu()
 
 if is_hip():
     FP8_DTYPE = torch.float8_e4m3fnuz
@@ -379,7 +380,7 @@ class C4IndexerBackend:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120:
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120 or _is_xpu:
             fn = fp8_paged_mqa_logits_torch
         else:
             if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:

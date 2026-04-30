@@ -243,14 +243,15 @@ class DeepSeekMxfp4MoEMethod:
 
             from sglang.srt.utils.common import get_device_sm
             _sm = get_device_sm()
-            if not is_sm90_supported() and _sm // 10 != 12:
-                raise RuntimeError(
-                    "DeepSeekV4 MXFP4 Marlin fallback requires Hopper/SM90 or above."
-                )
+            # if not is_sm90_supported() and _sm // 10 != 12:
+            #     raise RuntimeError(
+            #         "DeepSeekV4 MXFP4 Marlin fallback requires Hopper/SM90 or above."
+            #     )
 
             # SM120: Skip Marlin repacking, keep original weight format
             # for PyTorch dequant fallback (Marlin kernel produces NaN on SM120)
-            if _sm // 10 == 12:
+            # if _sm // 10 == 12:
+            if True:
                 log_info_on_rank0(
                     logger,
                     f"SM120 detected: using PyTorch MXFP4 MoE fallback "

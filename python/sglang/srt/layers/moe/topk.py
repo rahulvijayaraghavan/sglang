@@ -392,6 +392,8 @@ def fused_topk_torch_native(
     if correction_bias is not None:
         n_routed_experts = gating_output.shape[-1]
         scores = scoring_func_impl(gating_output)
+        if correction_bias.device != scores.device:
+            correction_bias = correction_bias.to(scores.device)
         scores_for_choice = scores.view(
             -1, n_routed_experts
         ) + correction_bias.unsqueeze(0)

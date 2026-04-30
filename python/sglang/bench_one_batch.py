@@ -463,6 +463,7 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    initialize_moe_config(server_args)
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None

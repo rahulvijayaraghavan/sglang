@@ -1234,6 +1234,9 @@ class ServerArgs:
                 logger.info(
                     f"Setting swa_full_tokens_ratio to {self.swa_full_tokens_ratio} for {model_arch}."
                 )
+            self._set_default_nsa_backends(self.kv_cache_dtype, None)
+            self.moe_runner_backend = "marlin"
+
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
@@ -2605,6 +2608,7 @@ class ServerArgs:
                     pass
 
             # Check attention backend
+            breakpoint()
             if self.attention_backend is None:
                 # User didn't specify attention backend, fallback based on GPU architecture
                 if is_sm100_supported() or is_sm120_supported():

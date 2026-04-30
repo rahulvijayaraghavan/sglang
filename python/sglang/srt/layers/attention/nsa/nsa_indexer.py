@@ -17,22 +17,26 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_sm103 = _is_cuda and get_device_sm() == 103
-_is_sm120 = _is_cuda and get_device_sm() // 10 == 12  # SM120/SM121 (RTX 5090, RTX PRO 6000, DGX Spark)
+# _is_sm120 = _is_cuda and get_device_sm() // 10 == 12  # SM120/SM121 (RTX 5090, RTX PRO 6000, DGX Spark)
+_is_sm120 = True
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_xpu = is_xpu()
+
 if _is_cuda:
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
 
-if _is_sm120:
+if _is_sm120 or _is_xpu:
     from sglang.srt.layers.attention.nsa.sm120_mqa_fallback import (
         compute_paged_mqa_schedule_metadata as _sm120_compute_paged_mqa_schedule_metadata,
         sm120_fp8_paged_mqa_logits as _sm120_fp8_paged_mqa_logits,
@@ -395,7 +399,7 @@ class Indexer(MultiPlatformOp):
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         if _is_cuda:
             if schedule_metadata is None:
-                if _is_sm120:
+                if _is_sm120 or _is_xpu:
                     schedule_metadata = _sm120_compute_paged_mqa_schedule_metadata(
                         seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
                         blocksize,
@@ -449,7 +453,7 @@ class Indexer(MultiPlatformOp):
                 TotalCuCount=256,
                 WavePerEU=5,
             )
-        elif _is_sm120:
+        elif _is_sm120 or _is_xpu:
             logits = _sm120_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -576,7 +580,7 @@ class Indexer(MultiPlatformOp):
                     logits = fp8_mqa_logits(
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
-                elif _is_sm120:
+                elif _is_sm120 or _is_xpu:
                     logits = _sm120_fp8_mqa_logits(
                         q_fp8[:q_offset],
                         kv_fp8,
@@ -635,7 +639,7 @@ class Indexer(MultiPlatformOp):
                         ks[start:end],
                         ke[start:end],
                     )
-                elif _is_sm120:
+                elif _is_sm120 or _is_xpu:
                     logits_chunk = _sm120_fp8_mqa_logits(
                         q_fp8[start:end],
                         kv_fp8,

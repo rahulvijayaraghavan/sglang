@@ -15,13 +15,16 @@ import logging
 
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 from sglang.srt.utils.common import get_device_sm
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = torch.cuda.is_available() and not is_hip()
-_is_sm120 = _is_cuda and get_device_sm() // 10 == 12
+# _is_sm120 = _is_cuda and get_device_sm() // 10 == 12
+_is_sm120 = True
+
+_is_xpu = is_xpu()
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -181,7 +184,7 @@ def _sm120_sparse_decode_fwd(q, k_cache, indices, topk_length, attn_sink,
 
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
-    if _is_sm120:
+    if _is_sm120 or _is_xpu:
         q = kwargs["q"]
         k_cache = kwargs["k_cache"]
         indices = kwargs["indices"]

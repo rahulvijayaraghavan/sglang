@@ -116,6 +116,7 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
+    return None
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
