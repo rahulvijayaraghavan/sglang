@@ -118,6 +118,20 @@ _E2M1_LUT = torch.tensor(
     dtype=torch.float32,
 )
 
+# Per-(device, dtype) cache of the LUT to avoid the per-call host->device
+# copy + sync that ``_E2M1_LUT.to(device=..., dtype=...)`` triggers on XPU.
+_E2M1_LUT_CACHE: dict = {}
+
+
+def _get_e2m1_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (str(device), dtype)
+    cached = _E2M1_LUT_CACHE.get(key)
+    if cached is None:
+        cached = _E2M1_LUT.to(device=device, dtype=dtype)
+        _E2M1_LUT_CACHE[key] = cached
+    return cached
+
+
 # Number of experts to dequantize per iteration. Keeps peak intermediate
 # memory at ~CHUNK * N * K/2 * 10 bytes instead of E * N * K/2 * 10 bytes.
 _MXFP4_DEQUANT_EXPERT_CHUNK = 4
@@ -141,7 +155,7 @@ def _upcast_mxfp4_one_xpu(
     E, N, half_K = w_u8.shape
     K = half_K * 2
 
-    lut = _E2M1_LUT.to(device=w_u8.device, dtype=torch.bfloat16)
+    lut = _get_e2m1_lut(w_u8.device, torch.bfloat16)
     out = torch.empty(E, N, K, dtype=torch.bfloat16, device=w_u8.device)
 
     # Chunk over the expert dimension so the int64 index tensors
@@ -150,12 +164,18 @@ def _upcast_mxfp4_one_xpu(
     for start in range(0, E, CHUNK):
         end = min(start + CHUNK, E)
         chunk = w_u8[start:end]                       # [C, N, half_K]
-        hi = ((chunk >> 4) & 0xF).long()              # high nibble
-        lo = (chunk & 0xF).long()                     # low nibble
+        # Extract nibbles and gather via two flat index_select calls — a
+        # single contiguous 1-D gather is faster on Intel L0 than N-D
+        # advanced-index gathers (lut[hi], lut[lo]).
+        hi = (chunk >> 4) & 0xF
+        lo = chunk & 0xF
+        flat_lo = lo.reshape(-1).to(torch.long)
+        flat_hi = hi.reshape(-1).to(torch.long)
+        lo_vals = lut.index_select(0, flat_lo).view_as(lo)
+        hi_vals = lut.index_select(0, flat_hi).view_as(hi)
         # [0xAB] → [B, A]: low nibble first, high nibble second
-        paired = torch.stack((lut[lo], lut[hi]), dim=-1)  # [C, N, half_K, 2]
+        paired = torch.stack((lo_vals, hi_vals), dim=-1)  # [C, N, half_K, 2]
         out[start:end] = paired.view(end - start, N, K)
-        del hi, lo, paired
 
     # Apply MX block scales (group_size=32) in-place
     out = out.view(E, N, K // 32, 32)
@@ -675,11 +695,10 @@ def fused_experts_impl(
             filter_expert=filter_expert,
         )
 
-        # Release bf16 w1 immediately so the w2 upcast that follows GEMM1
-        # has the full transient budget to itself.
+        # Drop the bf16 w1 reference so the allocator can reuse its block
+        # for the w2 upcast that follows GEMM1.
         if mxfp4_xpu:
             del w1_eff
-            torch.xpu.empty_cache()
 
         # Activation function with multiplication
         if activation == "silu" and is_gated:
@@ -821,7 +840,6 @@ def fused_experts_impl(
 
         if mxfp4_xpu:
             del w2_eff
-            torch.xpu.empty_cache()
 
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
