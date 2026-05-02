@@ -196,11 +196,12 @@ def _sm120_sparse_decode_fwd(q, k_cache, indices, topk_length, attn_sink,
             inv_chunk = torch.cat([inv_chunk, extra_invalid_rows[start:end]], dim=1)
             del extra_kv_chunk
 
-        # Zero-out invalid KV rows so they contribute nothing (kernel parity).
-        kv_chunk[inv_chunk] = 0.0
-
         q_chunk = q_rows[start:end].float()  # (n, H_q, D_qk)
-        kv_f = kv_chunk.float()  # (n, T, _D)
+        # Scrub NaN from invalid-index dequant so the value reduction is not
+        # polluted by 0 * NaN = NaN. Done in-place after the float upcast to
+        # avoid a separate allocation; ``scores`` is masked to ``-inf`` below
+        # which gives invalid positions exactly zero weight.
+        kv_f = kv_chunk.float().nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
         kv_d = kv_f.shape[-1]
         if D_qk != kv_d:
             q_chunk = q_chunk[..., :kv_d]
