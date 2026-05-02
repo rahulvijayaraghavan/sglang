@@ -37,6 +37,14 @@ else:
     FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 
+# Bound peak memory of the vectorized fallback.  For each row we materialize
+#   chunk_size * page_table.shape[1] * block_size * head_dim bytes of fp32 KV
+# plus the gathered raw bytes, plus chunk_size * padded_seq_len * num_heads
+# fp32 scores.  256 MiB is plenty for typical (B, P) shapes while keeping
+# launch overhead low on XPU.
+_FP8_PAGED_MQA_LOGITS_CHUNK_BYTES = 256 * 1024 * 1024
+
+
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -47,6 +55,21 @@ def fp8_paged_mqa_logits_torch(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
+    """Vectorized pure-PyTorch fallback for fp8_paged_mqa_logits.
+
+    The original reference implementation looped in Python over ``batch_size``
+    and called ``int(seq_lens[i].item())`` per iteration, forcing a device
+    sync per query token per layer.  For prefill on DeepSeek V4 this is the
+    dominant cost on XPU since ``batch_size == num_prefill_tokens`` and the
+    indexer runs once per layer (e.g. 768 tokens * 43 layers = 33k host
+    syncs and 33k tiny F.linear launches).
+
+    This rewrite gathers the full KV slab once per chunk, computes scores in
+    a single batched matmul, and masks invalid positions with the device-side
+    ``seq_lens`` so no host sync is needed.  Out-of-range page-table entries
+    are clamped to a valid index so the gather can never read past the pool;
+    the corresponding scores are zeroed out by the position mask.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -62,31 +85,76 @@ def fp8_paged_mqa_logits_torch(
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
+    device = q_fp8.device
+    head_dim_with_sf = head_dim + 4
+    SCALE_OFFSET = block_size * head_dim
+
+    # Cap pages used per row to what fits into ``max_seq_len``; this is also
+    # the largest valid index any row will ever access.
+    max_pages_eff = (max_seq_len + block_size - 1) // block_size
+    P = min(page_table.shape[1], max_pages_eff)
+    padded_seq_len = P * block_size
+    # Pad result to ``max_seq_len`` so callers see the documented shape.
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
-    for i in range(batch_size):
-        q = q_fp8[i, 0]
-        q = q.to(torch.float32)
-        q_scale = weight[i]
-        seq_len = int(seq_lens[i].item())
-        assert seq_len <= max_seq_len
-        num_pages = (seq_len + block_size - 1) // block_size
-        padded_seq_len = num_pages * block_size
-        pages = page_table[i, :num_pages]
-        kvcache_fp8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
-        kvcache = kvcache_fp8[pages]
-        SCALE_OFFSET = block_size * head_dim
-        kvcache_value = kvcache[..., :SCALE_OFFSET].view(dtype=FP8_DTYPE)
-        kvcache_scale = kvcache[..., SCALE_OFFSET:].view(dtype=torch.float32)
-        kvcache_value = kvcache_value.to(torch.float32)
-        kvcache_scale = kvcache_scale.contiguous()
-        kvcache_value = kvcache_value.view(padded_seq_len, head_dim)
-        kvcache_scale = kvcache_scale.view(padded_seq_len)
-        score = F.linear(kvcache_value, q)
-        score = F.relu(score)
-        score *= q_scale[None, :]
-        score = score.sum(dim=1)
-        score *= kvcache_scale
-        logits[i, :seq_len] = score[:seq_len]
+
+    # Flatten the paged byte slab once: (num_pages_total, block_size*hd_with_sf)
+    kv_flat = kvcache_fp8.reshape(-1, block_size * head_dim_with_sf)
+    num_pages_total = kv_flat.shape[0]
+
+    # Per-row valid mask is computed against absolute token positions.
+    pos = torch.arange(padded_seq_len, device=device)
+
+    # Pick a per-chunk batch size that keeps the gathered fp32 KV slab within
+    # the configured byte budget.  4 bytes/elem * P * block_size * head_dim.
+    bytes_per_row = max(1, P * block_size * head_dim * 4)
+    chunk_size = max(1, _FP8_PAGED_MQA_LOGITS_CHUNK_BYTES // bytes_per_row)
+
+    # Pre-clamp page table so the gather is always in-bounds.  Out-of-range
+    # entries (rows past their seq_len, or padding) are mapped to page 0; the
+    # corresponding score positions are zeroed by the seq-len mask below.
+    pt = page_table[:, :P]
+    if num_pages_total > 0:
+        pt = pt.clamp_(min=0, max=num_pages_total - 1)
+
+    for s in range(0, batch_size, chunk_size):
+        e = min(s + chunk_size, batch_size)
+        cb = e - s
+
+        # (cb, P, block_size*hd_with_sf) bytes
+        kv = kv_flat[pt[s:e]]
+        # Split off value/scale halves and make them contiguous so view-as-dtype
+        # is legal after slicing the trailing dim.
+        kv_value_b = kv[..., :SCALE_OFFSET].contiguous()
+        kv_scale_b = kv[..., SCALE_OFFSET:].contiguous()
+
+        # bytes -> fp8 -> fp32, shape (cb, padded_seq_len, head_dim)
+        kv_value = (
+            kv_value_b.view(dtype=FP8_DTYPE)
+            .view(cb, padded_seq_len, head_dim)
+            .to(torch.float32)
+        )
+        # bytes -> fp32 scale per token, shape (cb, padded_seq_len)
+        kv_scale = kv_scale_b.view(dtype=torch.float32).view(cb, padded_seq_len)
+
+        # q: (cb, num_heads, head_dim) fp32
+        q = q_fp8[s:e, 0].to(torch.float32)
+
+        # score: (cb, padded_seq_len, num_heads)
+        score = torch.einsum("bsd,bhd->bsh", kv_value, q)
+        score = torch.relu(score)
+        score = score * weight[s:e].unsqueeze(1)
+        score = score.sum(dim=2)
+        score = score * kv_scale
+
+        # Mask positions outside [0, seq_len_i) to 0.
+        valid = pos.unsqueeze(0) < seq_lens[s:e].unsqueeze(1)
+        score = torch.where(valid, score, score.new_zeros(()))
+
+        # Write back; truncate or pad to max_seq_len.
+        write_len = min(padded_seq_len, max_seq_len)
+        logits[s:e, :write_len] = score[:, :write_len]
+        if write_len < max_seq_len:
+            logits[s:e, write_len:] = 0
 
     return logits
 
