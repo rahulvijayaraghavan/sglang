@@ -10,6 +10,10 @@ FlashMLA CUDA kernel -- it does NOT mean each token occupies
 On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
 is not available, so this module provides a pure-PyTorch fallback that
 reads the raw paged buffer with the correct addressing.
+
+When SGLANG_SM120_TRITON_FLASHMLA=1 (default), a fused Triton kernel is
+used instead of the PyTorch fallback for significantly better performance.
+Set to 0 to fall back to the pure-PyTorch path.
 """
 import logging
 import os
@@ -49,6 +53,8 @@ _GATHER_CHUNK = 16384  # tokens per chunk; ~16k * 1024 B ≈ 16 MiB output per c
 # once at import time so the forward path doesn't pay an os.environ lookup
 # per layer per decode step.
 _SM120_SPARSE_CHUNK_MIB = int(os.environ.get("SGLANG_SM120_SPARSE_CHUNK_MIB", "256"))
+
+_use_triton_flashmla = os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1"
 
 
 def _gather_and_dequant(k_cache, indices, page_size):
@@ -257,6 +263,18 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         extra_k_cache = kwargs.get("extra_k_cache")
         extra_indices = kwargs.get("extra_indices_in_kvcache")
         extra_topk_length = kwargs.get("extra_topk_length")
+
+        if (_is_sm120 or _is_xpu) and _use_triton_flashmla:
+            from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+                flash_mla_sparse_decode_triton,
+            )
+
+            out, lse = flash_mla_sparse_decode_triton(
+                q, k_cache, indices, topk_length, attn_sink,
+                head_dim_v, softmax_scale,
+                extra_k_cache, extra_indices, extra_topk_length,
+            )
+            return (out, lse)
 
         out, lse = _sm120_sparse_decode_fwd(
             q, k_cache, indices, topk_length, attn_sink,
