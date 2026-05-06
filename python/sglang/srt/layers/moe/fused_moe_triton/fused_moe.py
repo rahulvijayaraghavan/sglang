@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
+import triton
 import triton.language as tl
 
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
@@ -132,9 +133,107 @@ def _get_e2m1_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return cached
 
 
-# Number of experts to dequantize per iteration. Keeps peak intermediate
-# memory at ~CHUNK * N * K/2 * 10 bytes instead of E * N * K/2 * 10 bytes.
-_MXFP4_DEQUANT_EXPERT_CHUNK = 4
+# ---------------------------------------------------------------------------
+# Triton MXFP4 dequant kernel: replaces the PyTorch loop-based upcast.
+# One kernel launch converts [E, N, half_K] packed uint8 -> [E, N, K] bf16
+# with fused block-scale multiplication.  No int64 intermediates, no
+# host syncs, no thousands of small kernel launches.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _mxfp4_dequant_kernel(
+    W_ptr,     # [E*N, half_K] uint8  - packed weights (flattened E*N)
+    S_ptr,     # [E*N, half_K // 16] float32 - block scales
+    LUT_ptr,   # [16] bfloat16 - E2M1 lookup table
+    Out_ptr,   # [E*N, K] bfloat16 - output
+    half_K,    # K // 2  (packed dimension)
+    stride_wn,
+    stride_sn,
+    stride_on,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Dequantise MXFP4-packed weights to bf16 with block-scale fusion.
+
+    Grid: (cdiv(E*N, BLOCK_N), cdiv(half_K, BLOCK_K))
+    """
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    w_off = rn[:, None] * stride_wn + rk[None, :]
+    mask = rk[None, :] < half_K
+    packed = tl.load(W_ptr + w_off, mask=mask, other=0)
+
+    lo = (packed & 0xF).to(tl.int32)
+    hi = ((packed >> 4) & 0xF).to(tl.int32)
+
+    lo_val = tl.load(LUT_ptr + lo).to(tl.float32)
+    hi_val = tl.load(LUT_ptr + hi).to(tl.float32)
+
+    scale_col = rk[None, :] // 16
+    s_off = rn[:, None] * stride_sn + scale_col
+    scale = tl.load(S_ptr + s_off, mask=mask, other=1.0).to(tl.float32)
+
+    lo_out = (lo_val * scale).to(tl.bfloat16)
+    hi_out = (hi_val * scale).to(tl.bfloat16)
+
+    out_off_lo = rn[:, None] * stride_on + rk[None, :] * 2
+    out_off_hi = out_off_lo + 1
+    tl.store(Out_ptr + out_off_lo, lo_out, mask=mask)
+    tl.store(Out_ptr + out_off_hi, hi_out, mask=mask)
+
+
+def _upcast_mxfp4_triton(
+    w_packed: torch.Tensor,
+    w_scale: torch.Tensor,
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Triton-accelerated MXFP4 -> bf16 dequant with fused block-scale multiply.
+
+    Replaces the PyTorch loop that generated thousands of small kernel
+    launches with a single Triton kernel launch per weight tensor.
+
+    w_packed : [E, N, K//2]  uint8   - two E2M1 values per byte
+    w_scale  : [E, N, K//32] float32 - MX block scale (direct multiplier)
+    Returns  : [E, N, K]     target_dtype - contiguous
+    """
+    w_u8 = w_packed.view(torch.uint8).contiguous()
+    E, N, half_K = w_u8.shape
+    K = half_K * 2
+
+    lut = _get_e2m1_lut(w_u8.device, torch.bfloat16).contiguous()
+    out = torch.empty(E, N, K, dtype=torch.bfloat16, device=w_u8.device)
+
+    w_flat = w_u8.reshape(E * N, half_K)
+    s_flat = w_scale.to(torch.float32).reshape(E * N, half_K // 16).contiguous()
+    out_flat = out.reshape(E * N, K)
+
+    stride_wn = half_K
+    stride_sn = half_K // 16
+    stride_on = K
+
+    BLOCK_N = 4
+    BLOCK_K = min(128, half_K)
+    total_rows = E * N
+    grid = (
+        triton.cdiv(total_rows, BLOCK_N),
+        triton.cdiv(half_K, BLOCK_K),
+    )
+
+    _mxfp4_dequant_kernel[grid](
+        w_flat, s_flat, lut, out_flat,
+        half_K,
+        stride_wn, stride_sn, stride_on,
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    if target_dtype != torch.bfloat16:
+        out = out.to(target_dtype)
+    return out
 
 
 def _upcast_mxfp4_one_xpu(
@@ -142,49 +241,15 @@ def _upcast_mxfp4_one_xpu(
     w_scale: torch.Tensor,
     target_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Upcast a single MXFP4-packed expert tensor to *target_dtype*.
+    """Upcast MXFP4-packed expert weights to *target_dtype*.
 
-    Packing convention (matches DeepSeek / sgl-kernel-xpu):
-        byte = [first_elem (high nibble) | second_elem (low nibble)]
+    Uses a fused Triton dequant kernel (single kernel launch).
 
     w_packed : [E, N, K//2]  uint8/int8   — two E2M1 values per byte
     w_scale  : [E, N, K//32] float32      — MX block scale (direct multiplier)
     Returns  : [E, N, K]     target_dtype — contiguous
     """
-    w_u8 = w_packed.view(torch.uint8)
-    E, N, half_K = w_u8.shape
-    K = half_K * 2
-
-    lut = _get_e2m1_lut(w_u8.device, torch.bfloat16)
-    out = torch.empty(E, N, K, dtype=torch.bfloat16, device=w_u8.device)
-
-    # Chunk over the expert dimension so the int64 index tensors
-    # (required by PyTorch advanced indexing) stay small.
-    CHUNK = _MXFP4_DEQUANT_EXPERT_CHUNK
-    for start in range(0, E, CHUNK):
-        end = min(start + CHUNK, E)
-        chunk = w_u8[start:end]                       # [C, N, half_K]
-        # Extract nibbles and gather via two flat index_select calls — a
-        # single contiguous 1-D gather is faster on Intel L0 than N-D
-        # advanced-index gathers (lut[hi], lut[lo]).
-        hi = (chunk >> 4) & 0xF
-        lo = chunk & 0xF
-        flat_lo = lo.reshape(-1).to(torch.long)
-        flat_hi = hi.reshape(-1).to(torch.long)
-        lo_vals = lut.index_select(0, flat_lo).view_as(lo)
-        hi_vals = lut.index_select(0, flat_hi).view_as(hi)
-        # [0xAB] → [B, A]: low nibble first, high nibble second
-        paired = torch.stack((lo_vals, hi_vals), dim=-1)  # [C, N, half_K, 2]
-        out[start:end] = paired.view(end - start, N, K)
-
-    # Apply MX block scales (group_size=32) in-place
-    out = out.view(E, N, K // 32, 32)
-    out.mul_(w_scale.unsqueeze(-1).to(torch.bfloat16))
-    out = out.contiguous().view(E, N, K)
-
-    if target_dtype != torch.bfloat16:
-        out = out.to(target_dtype)
-    return out
+    return _upcast_mxfp4_triton(w_packed, w_scale, target_dtype)
 
 
 def _log_mxfp4_xpu_budget(
