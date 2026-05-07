@@ -1905,6 +1905,19 @@ def compress_fused_norm_rope_inplace(
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     mode = 1 if plan.is_decode else 0
     if _is_xpu:
+        if True:
+        #if False:
+            from .triton_fused_norm_rope import _triton_fused_norm_rope
+            _triton_fused_norm_rope(
+                kv,
+                weight,
+                plan[1],
+                freq_cis,
+                mode,
+                eps,
+                plan.compress_ratio,
+            )
+            return
         _torch_fused_norm_rope(
             kv,
             weight,
@@ -1936,6 +1949,19 @@ def fused_norm_rope_inplace(
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
+        if True:
+        #if False:
+            from .triton_fused_norm_rope import _triton_fused_norm_rope
+            _triton_fused_norm_rope(
+                kv,
+                weight,
+                plan[1],
+                freq_cis,
+                mode,
+                eps,
+                plan.compress_ratio,
+            )
+            return
         _torch_fused_norm_rope(
             kv,
             weight,

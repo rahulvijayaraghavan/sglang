@@ -159,7 +159,11 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip or _is_sm103:
         from fast_hadamard_transform import hadamard_transform
     elif _is_xpu:
-        hadamard_transform = _torch_hadamard_transform
+        from .triton_hadamard_transform_optimized import _triton_hadamard_transform_optimized
+        from .triton_hadamard_transform import _triton_hadamard_transform
+        #hadamard_transform = _torch_hadamard_transform
+        #hadamard_transform = _triton_hadamard_transform
+        hadamard_transform = _triton_hadamard_transform_optimized
     else:
         try:
             from sgl_kernel import hadamard_transform
