@@ -264,7 +264,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
     def start(self):
         activity_map = {
             "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
+            "GPU": torch.profiler.ProfilerActivity.XPU,
         }
         torchprof_activities = [
             activity_map[a] for a in self.activities if a in activity_map
@@ -273,7 +273,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         if (
             envs.SGLANG_HACK_WARMUP_KINETO.get()
             and not _is_npu
-            and torch.profiler.ProfilerActivity.CUDA in torchprof_activities
+            and torch.profiler.ProfilerActivity.XPU in torchprof_activities
         ):
             from sglang.srt.managers.scheduler_profiler_mixin import (
                 _warmup_kineto_once,

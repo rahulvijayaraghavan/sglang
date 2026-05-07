@@ -1345,7 +1345,7 @@ def pytorch_profile(name, func, *args, data_size=-1):
     global step_counter
     os.makedirs("trace", exist_ok=True)
     with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        activities=[ProfilerActivity.CPU, ProfilerActivity.XPU],
         # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
         # on_trace_ready=tensorboard_trace_handler('./log_dir'),
         record_shapes=True,

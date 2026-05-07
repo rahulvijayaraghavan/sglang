@@ -245,7 +245,7 @@ def throughput_test_once(
             "SGLANG_TORCH_PROFILER_DIR" in os.environ
         ), "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile()
+        backend.start_profile(start_step=10, num_steps=3)
 
     st = time.perf_counter()
     gen_out = backend.generate(
@@ -259,7 +259,7 @@ def throughput_test_once(
     if profile:
         dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
         known_files = set(os.listdir(dir))
-        backend.stop_profile()
+        #backend.stop_profile()
         monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":
@@ -297,10 +297,12 @@ def throughput_test_once(
 
 def monitor_trace_file(known_files, directory, interval=1):
     print(f"Monitoring {directory} for new trace files...")
+    cnt = 0
 
     while True:
         flag = False
         time.sleep(interval)
+        cnt += 1
         current_files = set(os.listdir(directory))
 
         new_files = current_files - known_files
@@ -323,7 +325,7 @@ def monitor_trace_file(known_files, directory, interval=1):
                     break
 
                 time.sleep(interval)
-        if flag:
+        if flag or cnt > 60:
             break
 
 
