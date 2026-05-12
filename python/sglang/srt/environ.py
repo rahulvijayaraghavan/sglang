@@ -541,6 +541,7 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    SGLANG_FP8_PAGED_MQA_LOGITS_TRITON = EnvBool(False)
 
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
