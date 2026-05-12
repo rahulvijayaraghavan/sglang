@@ -469,8 +469,11 @@ class C4IndexerBackend:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120 or _is_xpu:
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120:
             fn = fp8_paged_mqa_logits_torch
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TRITON.get() or _is_xpu:
+            from .triton_fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
+            fn = fp8_paged_mqa_logits_triton
         else:
             if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
                 from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
