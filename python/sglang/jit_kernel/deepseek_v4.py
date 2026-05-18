@@ -657,9 +657,21 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
-    module.forward(q, k, freqs_real, positions, inverse)
+    if _is_cuda:
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+        module = _jit_fused_rope_module()
+        module.forward(q, k, freqs_real, positions, inverse)
+    else:
+        # Triton fallback for non-CUDA backends (e.g. XPU). Mirrors
+        # FusedQKRopeKernel: apply rotary embedding in-place to q and
+        # (when provided) k.
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(
+                k, freqs_cis, positions=positions, inverse=inverse
+            )
 
 
 # Alias for V2 code paths
