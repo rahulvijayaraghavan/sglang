@@ -13,9 +13,9 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_cuda
 
-_is_xpu = is_xpu()
+_is_cuda = is_cuda()
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -467,8 +467,9 @@ class CompressorPrefillPlan(NamedTuple):
             pin_memory=seq_lens.is_cpu,
         )
         is_overlap = compress_ratio == 4
-        if _is_xpu:
-            plan_lens = _plan_compress_prefill_torch(
+        if _is_cuda:
+            module = _jit_common_module()
+            plan_lens = module.plan_compress_prefill(
                 extend_lens,
                 seq_lens,
                 plan_tensor[0],
@@ -478,8 +479,7 @@ class CompressorPrefillPlan(NamedTuple):
                 use_cuda_graph,
             )
         else:
-            module = _jit_common_module()
-            plan_lens = module.plan_compress_prefill(
+            plan_lens = _plan_compress_prefill_torch(
                 extend_lens,
                 seq_lens,
                 plan_tensor[0],
@@ -676,8 +676,12 @@ def fused_q_norm_rope(
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
-    module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
-    module.forward(q_input, q_output, freqs_real, positions, eps)
+    if _is_cuda:
+        module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
+        module.forward(q_input, q_output, freqs_real, positions, eps)
+    else:
+        from .fused_q_norm_rope_torch import fused_q_norm_rope_torch
+        fused_q_norm_rope_torch(q_input, q_output, eps, freqs_real, positions)
 
 
 def fused_q_indexer_rope_hadamard_quant(
